@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/wait.h>
 
 #include <cstring>
 #include <cstdio>
@@ -63,58 +64,57 @@ int main()
         return 1;
     }
 
-    // 4. accept clients
+    // signal(sig,handler) registers what this process shud do when the signal sig arrives. 
+
+    signal(SIGCHLD, SIG_IGN); // auto reaps children no need to waitpid
+   
     while (true)
     {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
-        // client already send options providing addresses to store them and then print that information 
+        // client already send options providing addresses to store them and then print that information
         int client_fd = accept(
             socket_fd,
             (struct sockaddr *)&client_addr,
             &client_len);
-        printf("Client connected from %s:%d\n",
-               inet_ntoa(client_addr.sin_addr),
-               ntohs(client_addr.sin_port));
         if (client_fd == -1)
         {
             perror("accept");
             continue;
         }
+        printf("Client connected from %s:%d\n",
+               inet_ntoa(client_addr.sin_addr),
+               ntohs(client_addr.sin_port));
 
-        // 5. read() then write()
-        char buffer[BUFFER_SIZE];
-        // ssize_t is an integer type specifically intended for representing sizes/counts returned by system calls,
-        ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
-        // Give me whatever bytes are currently available, up to 1024 bytes.
-        
-        if (bytes_read == -1)
+        pid_t pid = fork();
+        if (pid == -1)
         {
-            perror("read");
+            perror("fork");
             close(client_fd);
             continue;
         }
-
-        while (bytes_read > 0)
+        else if (pid == 0)
         {
-            // perform partial write
-            while (bytes_read > 0)
-            {
-                ssize_t bytes_written = write(client_fd, buffer, bytes_read);
-                if (bytes_written == -1)
-                {
-                    perror("write");
-                    break;
-                }
-                bytes_read -= bytes_written;
-            }
-            bytes_read = read(client_fd, buffer, sizeof(buffer));
-        }
 
-        printf("Client disconnected");
-        // 6. close client
-        close(client_fd);
+
+            // If 5 children are holding copies and you Ctrl + C the parent, port 8080 remains occupied by those children
+            
+            close(socket_fd); 
+            // exec() only takes strings, so convert the fd number to a string
+            char fd_str[16];
+            snprintf(fd_str, sizeof(fd_str), "%d", client_fd);
+
+
+            // when execl run all variables are wiped out but descriptors arent closed so closed manually above
+            execl("./child", "./child", fd_str, (char *)NULL);
+            perror("execl"); // only reached if exec fails
+            return 1;
+        }
+        else
+        {
+            close(client_fd);
+        }
     }
 
     // Never reached in this version

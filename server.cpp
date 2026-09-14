@@ -20,7 +20,18 @@ int main()
         perror("socket");
         return 1;
     }
+    int opt = 1;
 
+    // sockets have multiple options, setsockopt() allows to set any option each call is for a particular option. Here we set the SO_REUSEADDR option to allow the socket to be bound to an address that is already in use.
+    // If server is closed with ctrl+c and restarted quickly, the socket may still be in TIME_WAIT state and the bind() call will fail with "Address already in use" error. Setting SO_REUSEADDR allows the server to bind to the same address and port even if they are still in use by a previous instance of the server.
+    setsockopt(
+        socket_fd,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &opt,
+        sizeof(opt));
+    
+    
     // 2. bind()
     // struct sockaddr_in
     // {
@@ -55,8 +66,17 @@ int main()
     // 4. accept clients
     while (true)
     {
-        int client_fd = accept(socket_fd, nullptr, nullptr);
-        printf("Client connected\n");
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        // client already send options providing addresses to store them and then print that information 
+        int client_fd = accept(
+            socket_fd,
+            (struct sockaddr *)&client_addr,
+            &client_len);
+        printf("Client connected from %s:%d\n",
+               inet_ntoa(client_addr.sin_addr),
+               ntohs(client_addr.sin_port));
         if (client_fd == -1)
         {
             perror("accept");
@@ -92,7 +112,7 @@ int main()
             bytes_read = read(client_fd, buffer, sizeof(buffer));
         }
 
-        printf("Client disconnected\n");
+        printf("Client disconnected");
         // 6. close client
         close(client_fd);
     }

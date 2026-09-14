@@ -56,7 +56,7 @@ int main()
     while (true)
     {
         int client_fd = accept(socket_fd, nullptr, nullptr);
-
+        printf("Client connected\n");
         if (client_fd == -1)
         {
             perror("accept");
@@ -67,7 +67,8 @@ int main()
         char buffer[BUFFER_SIZE];
         // ssize_t is an integer type specifically intended for representing sizes/counts returned by system calls,
         ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
-
+        // Give me whatever bytes are currently available, up to 1024 bytes.
+        
         if (bytes_read == -1)
         {
             perror("read");
@@ -75,16 +76,23 @@ int main()
             continue;
         }
 
-        if (bytes_read > 0)
+        while (bytes_read > 0)
         {
-            ssize_t bytes_written = write(client_fd, buffer, bytes_read);
-
-            if (bytes_written == -1)
+            // perform partial write
+            while (bytes_read > 0)
             {
-                perror("write");
+                ssize_t bytes_written = write(client_fd, buffer, bytes_read);
+                if (bytes_written == -1)
+                {
+                    perror("write");
+                    break;
+                }
+                bytes_read -= bytes_written;
             }
+            bytes_read = read(client_fd, buffer, sizeof(buffer));
         }
 
+        printf("Client disconnected\n");
         // 6. close client
         close(client_fd);
     }

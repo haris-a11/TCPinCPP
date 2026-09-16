@@ -69,12 +69,13 @@ int main()
     }
     
     // a struct timeval{sec, microsec} representing the timeout for select.
-    timeval timeout{5, 0};
+    // timeval timeout{5, 0};
     // select(upperBound of fd, readfds, writefds, exceptfds, timeout)
     // it returns the count of fds that are set
-    int ready = select(max_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+    int ready = select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr);
     // select is a system call everything else is userspace
-
+    // the kernel will wake up the process when one of the fds is ready so timeout is not needed here.
+    
     if (ready < 0)
     {
       perror("select");
@@ -82,7 +83,7 @@ int main()
     }
     else if (ready == 0)
     {
-      std::cout << "No activity for 5s, looping again...\n";
+     
       continue;
     }
 

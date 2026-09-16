@@ -1,4 +1,2 @@
 server
-child
-server_thread
-server_nonBlocking
+learn/

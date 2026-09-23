@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <unordered_map>
 
 class EventLoop
 {
@@ -22,11 +24,20 @@ public:
 private:
   void setupListenSocket();
   void addFd(int fd, uint32_t events);
+  void modFd(int fd, uint32_t events);
   void removeFd(int fd);
   void handleAccept();
-  void handleClientEvent(int fd);
+  void handleClientEvent(int fd, uint32_t events);
+  bool flush(int fd);
+
+  // per-client state: bytes waiting to be written back
+  struct Connection
+  {
+    std::string outbuf;
+  };
 
   int port_;
   int listen_fd_ = -1;
   int epoll_fd_ = -1;
+  std::unordered_map<int, Connection> conns_;
 };

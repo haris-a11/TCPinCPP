@@ -6,6 +6,20 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdio>
+#include <cerrno>
+#include <fcntl.h>
+
+
+namespace
+{
+  bool setNonBlocking(int fd)
+  {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1)
+      return false;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
+  }
+}
 
 #define BUFFER_SIZE 1024
 #define MAX_EVENTS 32
@@ -19,10 +33,11 @@ EventLoop::EventLoop(int port) : port_(port)
   {
     perror("epoll_create1");
     close(listen_fd_);
+    listen_fd_ = -1;
     return;
   }
 
-  addFd(listen_fd_, EPOLLIN);
+  addFd(listen_fd_, EPOLLIN | EPOLLET);
 }
 
 EventLoop::~EventLoop()
@@ -35,7 +50,7 @@ EventLoop::~EventLoop()
 
 void EventLoop::setupListenSocket()
 {
-  listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+  listen_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
   if (listen_fd_ == -1)
   {
     perror("socket");
@@ -59,7 +74,7 @@ void EventLoop::setupListenSocket()
     return;
   }
 
-  if (listen(listen_fd_, 1) == -1)
+  if (listen(listen_fd_, SOMAXCONN) == -1)
   {
     perror("listen");
     close(listen_fd_);
@@ -76,56 +91,122 @@ void EventLoop::addFd(int fd, uint32_t events)
   epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
 }
 
+void EventLoop::modFd(int fd, uint32_t events)
+{
+  epoll_event ev{};
+  ev.events = events;
+  ev.data.fd = fd;
+  epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+}
+
 void EventLoop::removeFd(int fd)
 {
   epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
   close(fd);
+  conns_.erase(fd);
 }
 
 void EventLoop::handleAccept()
 {
-  struct sockaddr_in client_addr;
-  socklen_t client_len = sizeof(client_addr);
-
-  int client_fd = accept(listen_fd_, (struct sockaddr *)&client_addr, &client_len);
-  if (client_fd == -1)
+  // edge-triggered: accept everything queued until EAGAIN
+  while (true)
   {
-    perror("accept");
-    return;
-  }
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
 
-  addFd(client_fd, EPOLLIN);
-}
-
-void EventLoop::handleClientEvent(int fd)
-{
-  char buffer[BUFFER_SIZE];
-  ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
-
-  if (bytes_read == -1)
-  {
-    perror("read");
-    removeFd(fd);
-    return;
-  }
-
-  if (bytes_read == 0)
-  {
-    printf("Client disconnected\n");
-    removeFd(fd);
-    return;
-  }
-
-  while (bytes_read > 0)
-  {
-    ssize_t bytes_written = write(fd, buffer, bytes_read);
-    if (bytes_written == -1)
+    int client_fd = accept(listen_fd_, (struct sockaddr *)&client_addr, &client_len);
+    if (client_fd == -1)
     {
-      perror("write");
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        break;
+      if (errno == EINTR || errno == ECONNABORTED)
+        continue;
+      perror("accept");
       break;
     }
-    bytes_read -= bytes_written;
+
+    // client fds do not inherit O_NONBLOCK from the listen socket
+    if (!setNonBlocking(client_fd))
+    {
+      perror("fcntl");
+      close(client_fd);
+      continue;
+    }
+
+    conns_[client_fd] = Connection{};
+    addFd(client_fd, EPOLLIN | EPOLLET);
   }
+}
+
+void EventLoop::handleClientEvent(int fd, uint32_t events)
+{
+  if (events & (EPOLLERR | EPOLLHUP))
+  {
+    removeFd(fd);
+    return;
+  }
+
+  if (events & EPOLLIN)
+  {
+    // edge-triggered: drain the socket until EAGAIN
+    char buffer[BUFFER_SIZE];
+    while (true)
+    {
+      ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
+
+      if (bytes_read > 0)
+      {
+        conns_[fd].outbuf.append(buffer, bytes_read);
+        continue;
+      }
+
+      if (bytes_read == 0)
+      {
+        printf("Client disconnected\n");
+        removeFd(fd);
+        return;
+      }
+
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        break;
+      if (errno == EINTR)
+        continue;
+
+      perror("read");
+      removeFd(fd);
+      return;
+    }
+  }
+
+  // runs for EPOLLIN (new data to echo) and EPOLLOUT (socket writable again)
+  flush(fd);
+}
+
+// Write as much of outbuf as the socket accepts. Returns false if fd was closed.
+bool EventLoop::flush(int fd)
+{
+  std::string &out = conns_[fd].outbuf;
+
+  while (!out.empty())
+  {
+    // MSG_NOSIGNAL: a closed peer gives EPIPE instead of killing us with SIGPIPE
+    ssize_t bytes_written = send(fd, out.data(), out.size(), MSG_NOSIGNAL);
+    if (bytes_written == -1)
+    {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        break;
+      if (errno == EINTR)
+        continue;
+      perror("send");
+      removeFd(fd);
+      return false;
+    }
+    out.erase(0, bytes_written);
+  }
+
+  // only ask for EPOLLOUT while there is unsent data, or epoll spins
+  modFd(fd, out.empty() ? (EPOLLIN | EPOLLET) : (EPOLLIN | EPOLLOUT | EPOLLET));
+  return true;
 }
 
 void EventLoop::run()
@@ -141,6 +222,8 @@ void EventLoop::run()
 
     if (ready == -1)
     {
+      if (errno == EINTR)
+        continue;
       perror("epoll_wait");
       break;
     }
@@ -152,7 +235,7 @@ void EventLoop::run()
       if (fd == listen_fd_)
         handleAccept();
       else
-        handleClientEvent(fd);
+        handleClientEvent(fd, events[i].events);
     }
   }
 }

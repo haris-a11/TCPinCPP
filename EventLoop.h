@@ -1,7 +1,8 @@
 #pragma once
 
+#include "Connection.h"
+
 #include <cstdint>
-#include <string>
 #include <unordered_map>
 
 class EventLoop
@@ -28,15 +29,7 @@ private:
   void removeFd(int fd);
   void handleAccept();
   void handleClientEvent(int fd, uint32_t events);
-  bool flush(int fd);
-  void updateInterest(int fd, bool rearm);
-
-  // per-client state: bytes waiting to be written back
-  struct Connection
-  {
-    std::string outbuf;
-    uint32_t events = 0; // mask of events currently registered with epoll
-  };
+  void updateInterest(int fd, Connection &conn, bool rearm);
 
   int port_;
   int listen_fd_ = -1;

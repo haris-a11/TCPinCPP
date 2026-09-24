@@ -21,9 +21,7 @@ namespace
   }
 }
 
-#define BUFFER_SIZE 1024
 #define MAX_EVENTS 32
-#define MAX_OUTBUF (64 * 1024) // stop reading from a client once this much is unsent
 
 EventLoop::EventLoop(int port) : port_(port)
 {
@@ -103,8 +101,7 @@ void EventLoop::modFd(int fd, uint32_t events)
 void EventLoop::removeFd(int fd)
 {
   epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-  close(fd);
-  conns_.erase(fd);
+  conns_.erase(fd); // ~Connection closes the fd
 }
 
 void EventLoop::handleAccept()
@@ -134,14 +131,20 @@ void EventLoop::handleAccept()
       continue;
     }
 
-    conns_[client_fd] = Connection{};
-    conns_[client_fd].events = EPOLLIN | EPOLLET;
-    addFd(client_fd, EPOLLIN | EPOLLET);
+    // try_emplace builds the Connection in place (it can't be copied)
+    Connection &conn = conns_.try_emplace(client_fd, client_fd).first->second;
+    conn.registered_events = EPOLLIN | EPOLLET;
+    addFd(client_fd, conn.registered_events);
   }
 }
 
 void EventLoop::handleClientEvent(int fd, uint32_t events)
 {
+  auto it = conns_.find(fd);
+  if (it == conns_.end())
+    return;
+  Connection &conn = it->second;
+
   if (events & (EPOLLERR | EPOLLHUP))
   {
     removeFd(fd);
@@ -152,95 +155,43 @@ void EventLoop::handleClientEvent(int fd, uint32_t events)
 
   if (events & EPOLLIN)
   {
-    // edge-triggered: drain the socket until EAGAIN
-    char buffer[BUFFER_SIZE];
-    while (true)
+    Connection::ReadStatus status = conn.onReadable();
+    if (status == Connection::ReadStatus::Closed)
     {
-      // backpressure: leave the rest in the kernel until the client reads its echo
-      if (conns_[fd].outbuf.size() >= MAX_OUTBUF)
-      {
-        stopped_early = true;
-        break;
-      }
-
-      ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
-
-      if (bytes_read > 0)
-      {
-        conns_[fd].outbuf.append(buffer, bytes_read);
-        continue;
-      }
-
-      if (bytes_read == 0)
-      {
-        printf("Client disconnected\n");
-        removeFd(fd);
-        return;
-      }
-
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        break;
-      if (errno == EINTR)
-        continue;
-
-      perror("read");
       removeFd(fd);
       return;
     }
+    stopped_early = (status == Connection::ReadStatus::Paused);
   }
 
-  // runs for EPOLLIN (new data to echo) and EPOLLOUT (socket writable again)
-  if (!flush(fd))
-    return;
-
-  updateInterest(fd, stopped_early);
-}
-
-// Write as much of outbuf as the socket accepts. Returns false if fd was closed.
-bool EventLoop::flush(int fd)
-{
-  std::string &out = conns_[fd].outbuf;
-
-  while (!out.empty())
+  // runs for EPOLLIN (new replies queued) and EPOLLOUT (socket writable again)
+  if (!conn.flush() || conn.done())
   {
-    // MSG_NOSIGNAL: a closed peer gives EPIPE instead of killing us with SIGPIPE
-    ssize_t bytes_written = send(fd, out.data(), out.size(), MSG_NOSIGNAL);
-    if (bytes_written == -1)
-    {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        break;
-      if (errno == EINTR)
-        continue;
-      perror("send");
-      removeFd(fd);
-      return false;
-    }
-    // partial write: the kernel took only what fit in the send buffer
-    out.erase(0, bytes_written);
+    removeFd(fd);
+    return;
   }
 
-  return true;
+  updateInterest(fd, conn, stopped_early);
 }
 
 // Recompute what this client should be watched for; touch epoll only if it changed.
 // rearm: we stopped reading before EAGAIN, so ET won't fire again for the data
 // already queued. EPOLL_CTL_MOD re-checks readiness, so force it.
-void EventLoop::updateInterest(int fd, bool rearm)
+void EventLoop::updateInterest(int fd, Connection &conn, bool rearm)
 {
-  Connection &conn = conns_[fd];
   uint32_t want = EPOLLET;
 
   // EPOLLOUT only while there is unsent data, or epoll wakes us for nothing
-  if (!conn.outbuf.empty())
+  if (conn.wantsWrite())
     want |= EPOLLOUT;
-  // EPOLLIN only while the buffer has room (re-enabling it re-arms ET for queued data)
-  if (conn.outbuf.size() < MAX_OUTBUF)
+  // EPOLLIN only while open and the output buffer has room
+  if (conn.wantsRead())
     want |= EPOLLIN;
 
-  if (want != conn.events || rearm)
+  if (want != conn.registered_events || rearm)
   {
     modFd(fd, want);
-    conn.events = want;
+    conn.registered_events = want;
   }
 }
 

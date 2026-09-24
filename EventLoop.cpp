@@ -23,6 +23,7 @@ namespace
 
 #define BUFFER_SIZE 1024
 #define MAX_EVENTS 32
+#define MAX_OUTBUF (64 * 1024) // stop reading from a client once this much is unsent
 
 EventLoop::EventLoop(int port) : port_(port)
 {
@@ -134,6 +135,7 @@ void EventLoop::handleAccept()
     }
 
     conns_[client_fd] = Connection{};
+    conns_[client_fd].events = EPOLLIN | EPOLLET;
     addFd(client_fd, EPOLLIN | EPOLLET);
   }
 }
@@ -146,12 +148,21 @@ void EventLoop::handleClientEvent(int fd, uint32_t events)
     return;
   }
 
+  bool stopped_early = false;
+
   if (events & EPOLLIN)
   {
     // edge-triggered: drain the socket until EAGAIN
     char buffer[BUFFER_SIZE];
     while (true)
     {
+      // backpressure: leave the rest in the kernel until the client reads its echo
+      if (conns_[fd].outbuf.size() >= MAX_OUTBUF)
+      {
+        stopped_early = true;
+        break;
+      }
+
       ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
 
       if (bytes_read > 0)
@@ -179,7 +190,10 @@ void EventLoop::handleClientEvent(int fd, uint32_t events)
   }
 
   // runs for EPOLLIN (new data to echo) and EPOLLOUT (socket writable again)
-  flush(fd);
+  if (!flush(fd))
+    return;
+
+  updateInterest(fd, stopped_early);
 }
 
 // Write as much of outbuf as the socket accepts. Returns false if fd was closed.
@@ -201,12 +215,33 @@ bool EventLoop::flush(int fd)
       removeFd(fd);
       return false;
     }
+    // partial write: the kernel took only what fit in the send buffer
     out.erase(0, bytes_written);
   }
 
-  // only ask for EPOLLOUT while there is unsent data, or epoll spins
-  modFd(fd, out.empty() ? (EPOLLIN | EPOLLET) : (EPOLLIN | EPOLLOUT | EPOLLET));
   return true;
+}
+
+// Recompute what this client should be watched for; touch epoll only if it changed.
+// rearm: we stopped reading before EAGAIN, so ET won't fire again for the data
+// already queued. EPOLL_CTL_MOD re-checks readiness, so force it.
+void EventLoop::updateInterest(int fd, bool rearm)
+{
+  Connection &conn = conns_[fd];
+  uint32_t want = EPOLLET;
+
+  // EPOLLOUT only while there is unsent data, or epoll wakes us for nothing
+  if (!conn.outbuf.empty())
+    want |= EPOLLOUT;
+  // EPOLLIN only while the buffer has room (re-enabling it re-arms ET for queued data)
+  if (conn.outbuf.size() < MAX_OUTBUF)
+    want |= EPOLLIN;
+
+  if (want != conn.events || rearm)
+  {
+    modFd(fd, want);
+    conn.events = want;
+  }
 }
 
 void EventLoop::run()

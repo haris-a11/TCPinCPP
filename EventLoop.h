@@ -29,11 +29,13 @@ private:
   void handleAccept();
   void handleClientEvent(int fd, uint32_t events);
   bool flush(int fd);
+  void updateInterest(int fd, bool rearm);
 
   // per-client state: bytes waiting to be written back
   struct Connection
   {
     std::string outbuf;
+    uint32_t events = 0; // mask of events currently registered with epoll
   };
 
   int port_;

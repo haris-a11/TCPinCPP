@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -31,7 +32,13 @@ public:
 
   bool wantsRead() const;
   bool wantsWrite() const;
-  bool done() const; 
+  bool done() const;
+
+  // stop reading, queue a final notice, close once it is flushed
+  void beginClose(const std::string &notice);
+
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point lastActive() const { return last_active_; }
 
   uint32_t registered_events = 0; // mask of events currently registered with epoll for this connection
 
@@ -44,4 +51,5 @@ private:
   State state_ = State::Open;
   std::string inbuf_;  // bytes received but not yet a complete message
   std::string outbuf_; // bytes queued but not yet accepted by the kernel
+  Clock::time_point last_active_; // last time bytes moved in either direction
 };

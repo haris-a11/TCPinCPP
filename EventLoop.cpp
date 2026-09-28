@@ -1,6 +1,7 @@
 #include "EventLoop.h"
 
 #include <sys/epoll.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -8,6 +9,8 @@
 #include <cstdio>
 #include <cerrno>
 #include <fcntl.h>
+#include <csignal>
+#include <vector>
 
 
 namespace
@@ -22,6 +25,14 @@ namespace
 }
 
 #define MAX_EVENTS 32
+#define SWEEP_INTERVAL_MS 1000 // epoll_wait timeout = how often idle clients are checked
+#ifndef IDLE_TIMEOUT_S
+#define IDLE_TIMEOUT_S 30      // close clients with no traffic for this long
+#endif
+#define SHUTDOWN_GRACE_S 5     // time clients get to receive queued replies on shutdown
+
+using std::chrono::milliseconds;
+using std::chrono::seconds;
 
 EventLoop::EventLoop(int port) : port_(port)
 {
@@ -37,14 +48,121 @@ EventLoop::EventLoop(int port) : port_(port)
   }
 
   addFd(listen_fd_, EPOLLIN | EPOLLET);
+  setupSignals();
+
+  spare_fd_ = open("/dev/null", O_RDONLY | O_CLOEXEC);
 }
 
 EventLoop::~EventLoop()
 {
+  conns_.clear(); // ~Connection closes every client fd
+  if (spare_fd_ != -1)
+    close(spare_fd_);
+  if (signal_fd_ != -1)
+    close(signal_fd_);
   if (epoll_fd_ != -1)
     close(epoll_fd_);
   if (listen_fd_ != -1)
     close(listen_fd_);
+}
+
+// Turn SIGINT/SIGTERM into an fd epoll can watch, instead of an async handler
+// that could interrupt us in the middle of anything.
+void EventLoop::setupSignals()
+{
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGINT);
+  sigaddset(&mask, SIGTERM);
+
+  // blocked signals are not delivered to a handler; they queue up for signalfd
+  if (sigprocmask(SIG_BLOCK, &mask, nullptr) == -1)
+  {
+    perror("sigprocmask");
+    return;
+  }
+
+  signal_fd_ = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+  if (signal_fd_ == -1)
+  {
+    perror("signalfd");
+    return;
+  }
+
+  // level-triggered on purpose: we read one signal per wakeup and epoll
+  // reports it again if another is still pending
+  addFd(signal_fd_, EPOLLIN);
+}
+
+void EventLoop::handleSignal()
+{
+  signalfd_siginfo info;
+  if (read(signal_fd_, &info, sizeof(info)) != sizeof(info))
+    return;
+
+  printf("Received %s\n", strsignal(info.ssi_signo));
+
+  if (shutting_down_)
+  {
+    // second Ctrl+C: stop waiting for slow clients
+    printf("Forcing shutdown\n");
+    shutdown_deadline_ = Connection::Clock::now();
+    return;
+  }
+
+  beginShutdown();
+}
+
+void EventLoop::beginShutdown()
+{
+  shutting_down_ = true;
+  shutdown_deadline_ = Connection::Clock::now() + seconds(SHUTDOWN_GRACE_S);
+
+  // stop accepting: new clients get "connection refused" instead of hanging
+  epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
+  close(listen_fd_);
+  listen_fd_ = -1;
+
+  // copy the fds first: removeFd erases from conns_ while we walk it
+  std::vector<int> fds;
+  for (auto &entry : conns_)
+    fds.push_back(entry.first);
+
+  for (int fd : fds)
+  {
+    Connection &conn = conns_.at(fd);
+    conn.beginClose("ERR server shutting down");
+    if (!conn.flush() || conn.done())
+    {
+      removeFd(fd);
+      continue;
+    }
+    updateInterest(fd, conn, false); // drops EPOLLIN, keeps EPOLLOUT until flushed
+  }
+
+  printf("Shutting down, waiting for %zu client(s)\n", conns_.size());
+}
+
+// Covers both idle clients and dead ones (peer vanished without FIN/RST):
+// either way no bytes have moved for IDLE_TIMEOUT_S.
+void EventLoop::closeIdleConnections()
+{
+  Connection::Clock::time_point now = Connection::Clock::now();
+  if (now - last_sweep_ < milliseconds(SWEEP_INTERVAL_MS))
+    return;
+  last_sweep_ = now;
+
+  for (auto it = conns_.begin(); it != conns_.end();)
+  {
+    if (now - it->second.lastActive() > seconds(IDLE_TIMEOUT_S))
+    {
+      printf("Closing idle connection (fd %d)\n", it->first);
+      epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->first, nullptr);
+      it = conns_.erase(it); // erase returns the next valid iterator
+    }
+    else
+      ++it;
+  }
 }
 
 void EventLoop::setupListenSocket()
@@ -119,6 +237,22 @@ void EventLoop::handleAccept()
         break;
       if (errno == EINTR || errno == ECONNABORTED)
         continue;
+      if ((errno == EMFILE || errno == ENFILE) && spare_fd_ != -1)
+      {
+        // out of fds: under ET the queued client would never fire again, so
+        // free the spare fd, accept the client and drop it, then re-reserve
+        close(spare_fd_);
+        int shed_fd = accept(listen_fd_, nullptr, nullptr);
+        if (shed_fd != -1)
+          close(shed_fd); // before re-reserving, or the open() has no fd to use
+        spare_fd_ = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        // EMFILE is reported even when the queue is empty, so stop once
+        // there was nothing left to shed or this loop never ends
+        if (shed_fd == -1)
+          break;
+        fprintf(stderr, "accept: out of file descriptors, dropped a client\n");
+        continue;
+      }
       perror("accept");
       break;
     }
@@ -197,14 +331,18 @@ void EventLoop::updateInterest(int fd, Connection &conn, bool rearm)
 
 void EventLoop::run()
 {
-  if (listen_fd_ == -1 || epoll_fd_ == -1)
+  if (listen_fd_ == -1 || epoll_fd_ == -1 || signal_fd_ == -1)
     return;
 
   epoll_event events[MAX_EVENTS];
+  last_sweep_ = Connection::Clock::now();
 
-  while (true)
+  // normal mode: forever. shutdown mode: until every client is gone or the grace period ends
+  while (!shutting_down_ ||
+         (!conns_.empty() && Connection::Clock::now() < shutdown_deadline_))
   {
-    int ready = epoll_wait(epoll_fd_, events, MAX_EVENTS, -1);
+    // a timeout instead of -1 so idle connections are checked even when nothing happens
+    int ready = epoll_wait(epoll_fd_, events, MAX_EVENTS, SWEEP_INTERVAL_MS);
 
     if (ready == -1)
     {
@@ -220,8 +358,17 @@ void EventLoop::run()
 
       if (fd == listen_fd_)
         handleAccept();
+      else if (fd == signal_fd_)
+        handleSignal();
       else
         handleClientEvent(fd, events[i].events);
     }
+
+    closeIdleConnections();
   }
+
+  if (!conns_.empty())
+    printf("Grace period over, dropping %zu client(s)\n", conns_.size());
+  conns_.clear();
+  printf("Server stopped\n");
 }

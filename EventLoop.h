@@ -30,9 +30,19 @@ private:
   void handleAccept();
   void handleClientEvent(int fd, uint32_t events);
   void updateInterest(int fd, Connection &conn, bool rearm);
+  void setupSignals();
+  void handleSignal();
+  void beginShutdown();
+  void closeIdleConnections();
 
   int port_;
   int listen_fd_ = -1;
   int epoll_fd_ = -1;
+  int signal_fd_ = -1; // SIGINT/SIGTERM delivered as readable data
+  int spare_fd_ = -1;  // reserved fd, released to shed clients when we hit EMFILE
   std::unordered_map<int, Connection> conns_;
+
+  bool shutting_down_ = false;
+  Connection::Clock::time_point shutdown_deadline_;
+  Connection::Clock::time_point last_sweep_;
 };

@@ -9,7 +9,7 @@
 #define MAX_OUTBUF (64 * 1024) // stop reading once this much is unsent
 #define MAX_LINE 4096          // longest request line we accept
 
-Connection::Connection(int fd) : fd_(fd) {}
+Connection::Connection(int fd) : fd_(fd), last_active_(Clock::now()) {}
 
 Connection::~Connection()
 {
@@ -31,6 +31,14 @@ bool Connection::done() const
   return state_ == State::Closing && outbuf_.empty();
 }
 
+void Connection::beginClose(const std::string &notice)
+{
+  if (state_ != State::Open)
+    return;
+  reply(notice);
+  state_ = State::Closing;
+}
+
 Connection::ReadStatus Connection::onReadable()
 {
   // edge-triggered: drain the socket until EAGAIN
@@ -48,6 +56,7 @@ Connection::ReadStatus Connection::onReadable()
 
     if (bytes_read > 0)
     {
+      last_active_ = Clock::now();
       inbuf_.append(buffer, bytes_read);
       processMessages();
       continue;
@@ -152,6 +161,8 @@ bool Connection::flush()
     }
     // partial write: the kernel took only what fit in the send buffer
     outbuf_.erase(0, bytes_written);
+    // a slow reader that is still making progress is not idle
+    last_active_ = Clock::now();
   }
   return true;
 }

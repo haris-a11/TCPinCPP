@@ -7,7 +7,8 @@
 
 #define BUFFER_SIZE 1024
 #define MAX_OUTBUF (64 * 1024) // stop reading once this much is unsent
-#define MAX_LINE 4096          // longest request line we accept
+#define MAX_HEADER 8192        // largest header block we accept
+
 
 Connection::Connection(int fd) : fd_(fd), last_active_(Clock::now()) {}
 
@@ -80,68 +81,58 @@ Connection::ReadStatus Connection::onReadable()
   }
 }
 
-// Framing: a message is everything up to '\n'. TCP is a byte stream, so one
-// read() may hold half a message or several; keep the leftover for next time.
+
+// Framing: a request is everything up to "\r\n\r\n". TCP is a byte stream,
+// so one read() may hold half a request or several; keep the leftover.
 void Connection::processMessages()
 {
   size_t start = 0;
   while (state_ == State::Open)
   {
-    size_t newline = inbuf_.find('\n', start);
-    if (newline == std::string::npos)
+    HttpRequest req;
+    size_t consumed = 0;
+    ParseResult r = parseRequest(inbuf_, start, req, consumed);
+
+    if (r == ParseResult::Incomplete)
       break;
 
-    std::string line = inbuf_.substr(start, newline - start);
-    start = newline + 1;
+    if (r == ParseResult::Bad)
+    {
+      reply("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      state_ = State::Closing;
+      break;
+    }
 
-    if (!line.empty() && line.back() == '\r') // telnet sends \r\n
-      line.pop_back();
-
-    handleMessage(line);
+    start += consumed;
+    handleRequest(req);
   }
 
-  // one erase for all consumed messages instead of one per message
   inbuf_.erase(0, start);
 
-  // a partial line that never ends would grow inbuf_ forever
-  if (inbuf_.size() > MAX_LINE)
+  // headers that never end would grow inbuf_ forever
+  if (state_ == State::Open && inbuf_.size() > MAX_HEADER)
   {
-    reply("ERR line too long");
+    reply("HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     inbuf_.clear();
     state_ = State::Closing;
   }
 }
 
-// Protocol: one command per line, one reply line per command.
-//   PING        -> PONG
-//   ECHO <text> -> <text>
-//   QUIT        -> BYE, then close
-void Connection::handleMessage(const std::string &line)
+void Connection::handleRequest(const HttpRequest &req)
 {
-  if (line.empty())
-    return;
+  printf("%s %s %s\n", req.method.c_str(), req.path.c_str(), req.version.c_str());
+  for (const auto &[name, value] : req.headers)
+    printf("  %s: %s\n", name.c_str(), value.c_str());
 
-  size_t space = line.find(' ');
-  std::string cmd = line.substr(0, space);
-  std::string arg = (space == std::string::npos) ? "" : line.substr(space + 1);
-
-  if (cmd == "PING")
-    reply("PONG");
-  else if (cmd == "ECHO")
-    reply(arg);
-  else if (cmd == "QUIT")
-  {
-    reply("BYE");
-    state_ = State::Closing;
-  }
-  else
-    reply("ERR unknown command");
+  // temporary: step 2 replaces this with a proper response builder
+  std::string body = "you asked for " + req.path + "\n";
+  reply("HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+        "\r\n\r\n" + body);
 }
 
 void Connection::reply(const std::string &msg)
 {
   outbuf_ += msg;
-  outbuf_ += '\n';
 }
 
 bool Connection::flush()

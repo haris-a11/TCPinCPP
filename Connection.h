@@ -1,5 +1,6 @@
 #pragma once
 
+#include "http.h"
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -44,7 +45,8 @@ public:
 
 private:
   void processMessages();
-  void handleMessage(const std::string &line);
+  void handleRequest(const HttpRequest &req);
+
   void reply(const std::string &msg);
 
   int fd_;

@@ -68,3 +68,42 @@ ParseResult parseRequest(const std::string &buf, size_t start,
   }
   return ParseResult::Ok;
 }
+
+const char *statusText(int status)
+{
+  switch (status)
+  {
+  case 200:
+    return "OK";
+  case 400:
+    return "Bad Request";
+  case 404:
+    return "Not Found";
+  case 405:
+    return "Method Not Allowed";
+  case 431:
+    return "Request Header Fields Too Large";
+  case 500:
+    return "Internal Server Error";
+  case 503:
+    return "Service Unavailable";
+  default:
+    return "Unknown";
+  }
+}
+
+std::string serializeResponse(const HttpResponse &res)
+{
+  std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " +
+                    statusText(res.status) + "\r\n";
+
+  for (const auto &[name, value] : res.headers)
+    out += name + ": " + value + "\r\n";
+
+  // computed here so it can never disagree with the body
+  out += "Content-Length: " + std::to_string(res.body.size()) + "\r\n";
+
+  out += "\r\n"; // end of headers
+  out += res.body;
+  return out;
+}

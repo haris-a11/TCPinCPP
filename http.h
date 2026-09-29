@@ -2,6 +2,10 @@
 
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+
 
 struct HttpRequest
 {
@@ -10,6 +14,24 @@ struct HttpRequest
   std::string version; // "HTTP/1.1"
   std::unordered_map<std::string, std::string> headers; 
 };
+
+struct HttpResponse
+{
+  int status = 200;
+  std::vector<std::pair<std::string, std::string>> headers;
+  std::string body;
+
+  void setHeader(const std::string &name, const std::string &value)
+  {
+    headers.emplace_back(name, value);
+  }
+};
+
+// 404 -> "Not Found"
+const char *statusText(int status);
+
+// Turn a response into the exact bytes to send. Adds Content-Length itself.
+std::string serializeResponse(const HttpResponse &res);
 
 enum class ParseResult
 {

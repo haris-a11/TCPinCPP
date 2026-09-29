@@ -48,6 +48,8 @@ private:
   void handleRequest(const HttpRequest &req);
 
   void reply(const std::string &msg);
+  void sendResponse(const HttpResponse &res);
+  void sendError(int status); // for framing errors: respond, then close
 
   int fd_;
   State state_ = State::Open;

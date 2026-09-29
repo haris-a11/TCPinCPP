@@ -98,8 +98,7 @@ void Connection::processMessages()
 
     if (r == ParseResult::Bad)
     {
-      reply("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-      state_ = State::Closing;
+      sendError(400);
       break;
     }
 
@@ -112,27 +111,57 @@ void Connection::processMessages()
   // headers that never end would grow inbuf_ forever
   if (state_ == State::Open && inbuf_.size() > MAX_HEADER)
   {
-    reply("HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     inbuf_.clear();
-    state_ = State::Closing;
+    sendError(431);
   }
 }
 
 void Connection::handleRequest(const HttpRequest &req)
 {
-  printf("%s %s %s\n", req.method.c_str(), req.path.c_str(), req.version.c_str());
-  for (const auto &[name, value] : req.headers)
-    printf("  %s: %s\n", name.c_str(), value.c_str());
+  printf("%s %s\n", req.method.c_str(), req.path.c_str());
 
-  // temporary: step 2 replaces this with a proper response builder
-  std::string body = "you asked for " + req.path + "\n";
-  reply("HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
-        "\r\n\r\n" + body);
+  HttpResponse res;
+  if (req.method != "GET")
+  {
+    res.status = 405;
+    res.setHeader("Allow", "GET"); // 405 must say what *is* allowed
+    res.body = "method not allowed\n";
+  }
+  else if (req.path == "/")
+  {
+    res.body = "hello from TCPinCPP\n";
+  }
+  else
+  {
+    res.status = 404;
+    res.body = "not found: " + req.path + "\n";
+  }
+
+  res.setHeader("Content-Type", "text/plain");
+  sendResponse(res);
 }
 
 void Connection::reply(const std::string &msg)
 {
   outbuf_ += msg;
+}
+
+void Connection::sendResponse(const HttpResponse &res)
+{
+  reply(serializeResponse(res));
+}
+
+// The request couldn't be framed, so we can't trust where the next one
+// starts: answer and close.
+void Connection::sendError(int status)
+{
+  HttpResponse res;
+  res.status = status;
+  res.setHeader("Content-Type", "text/plain");
+  res.setHeader("Connection", "close");
+  res.body = std::to_string(status) + " " + statusText(status) + "\n";
+  sendResponse(res);
+  state_ = State::Closing;
 }
 
 bool Connection::flush()
